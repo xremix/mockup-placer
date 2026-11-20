@@ -26,6 +26,11 @@ export class Renderer {
       uniform vec2 imageSize;
       uniform float radius;
       uniform float feather;
+      uniform float warmth;
+      uniform float tint;
+      uniform vec3 overlayColor;
+      uniform float overlayOpacity;
+      uniform int overlayMode;
       void main() {
         vec2 point = vec2(gl_FragCoord.x / outputSize.x, 1.0 - gl_FragCoord.y / outputSize.y);
         vec3 projected = mapping * vec3(point, 1.0);
@@ -37,6 +42,14 @@ export class Renderer {
         vec2 q = abs(uv * imageSize - imageSize * 0.5) - (imageSize * 0.5 - radius);
         float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
         vec4 color = ${this.modern ? "texture" : "texture2D"}(image, uv);
+        color.rgb = clamp(color.rgb + vec3(warmth * 0.25 + tint * 0.12, -tint * 0.2, -warmth * 0.25 + tint * 0.12), 0.0, 1.0);
+        vec3 blended = overlayColor;
+        if (overlayMode == 1) blended = color.rgb * overlayColor;
+        else if (overlayMode == 2) blended = 1.0 - (1.0 - color.rgb) * (1.0 - overlayColor);
+        else if (overlayMode == 3) blended = mix(2.0 * color.rgb * overlayColor, 1.0 - 2.0 * (1.0 - color.rgb) * (1.0 - overlayColor), step(0.5, color.rgb));
+        else if (overlayMode == 4) blended = min(color.rgb, overlayColor);
+        else if (overlayMode == 5) blended = max(color.rgb, overlayColor);
+        color.rgb = mix(color.rgb, blended, overlayOpacity);
         color.a *= 1.0 - smoothstep(-feather, feather, distance);
         ${this.modern ? "outputColor" : "gl_FragColor"} = color;
       }
@@ -55,7 +68,7 @@ export class Renderer {
     const attribute = gl.getAttribLocation(this.program, "position");
     gl.enableVertexAttribArray(attribute);
     gl.vertexAttribPointer(attribute, 2, gl.FLOAT, false, 0, 0);
-    this.uniforms = Object.fromEntries(["mapping", "outputSize", "imageSize", "radius", "feather"].map(name => [name, gl.getUniformLocation(this.program, name)]));
+    this.uniforms = Object.fromEntries(["mapping", "outputSize", "imageSize", "radius", "feather", "warmth", "tint", "overlayColor", "overlayOpacity", "overlayMode"].map(name => [name, gl.getUniformLocation(this.program, name)]));
     this.texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -111,6 +124,12 @@ export class Renderer {
     gl.uniform2f(uniforms.outputSize, width, height);
     gl.uniform2f(uniforms.imageSize, state.screenshot.width, state.screenshot.height);
     gl.uniform1f(uniforms.radius, state.radius);
+    gl.uniform1f(uniforms.warmth, state.warmth / 100);
+    gl.uniform1f(uniforms.tint, state.tint / 100);
+    const color = state.overlayColor;
+    gl.uniform3f(uniforms.overlayColor, parseInt(color.slice(1, 3), 16) / 255, parseInt(color.slice(3, 5), 16) / 255, parseInt(color.slice(5, 7), 16) / 255);
+    gl.uniform1f(uniforms.overlayOpacity, state.overlayOpacity / 100);
+    gl.uniform1i(uniforms.overlayMode, ["source-over", "multiply", "screen", "overlay", "darken", "lighten"].indexOf(state.overlayBlend));
     const area = Math.abs(state.corners.reduce((sum, p, i, points) => {
       const next = points[(i + 1) % 4];
       return sum + p.x * next.y - next.x * p.y;

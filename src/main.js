@@ -1,5 +1,8 @@
 import { initialCorners, iphoneRadius, isConvex } from "./geometry.js";
 import { Renderer } from "./renderer.js";
+import { originalExportFormat } from "./export-format.js";
+import { openProjects, listProjects, saveProject } from "./projects.js";
+import { colorDefaults, findMatchingProject, screenshotSettings } from "./project-settings.js";
 
 const $ = selector => document.querySelector(selector);
 const canvas = $("#preview");
@@ -7,13 +10,24 @@ const wrap = $("#canvas-wrap");
 const area = $("#drop-zone");
 const loupe = $("#loupe");
 const loupeContext = $("#loupe-canvas").getContext("2d");
-const state = { mockup: null, screenshot: null, corners: [], radius: 48, opacity: 1, blend: "source-over", format: "png", demo: true };
+const state = { mockup: null, screenshot: null, corners: [], radius: 48, opacity: 1, blend: "source-over", format: "png", demo: true, ...colorDefaults };
 let renderer;
 let frame = 0;
 let drag = null;
 let toastTimer;
 let exportInProgress = false;
 let loadRevision = 0;
+let projectDatabase;
+let projectId = null;
+let projectBusy = false;
+let dirty = false;
+let saveTimer;
+let saveQueue = Promise.resolve();
+let editRevision = 0;
+const previewModes = {};
+let zoom = 1;
+let zoomX = 0;
+let zoomY = 0;
 const handles = [];
 const labels = ["Top left", "Top right", "Bottom right", "Bottom left"];
 const demoCorners = [
@@ -43,7 +57,7 @@ function scheduleRender() {
   });
 }
 
-function render() {
+function render(preview = true) {
   if (!renderer || !state.mockup || !state.screenshot) return;
   const style = getComputedStyle(area);
   const availableWidth = area.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
@@ -53,8 +67,8 @@ function render() {
   const height = Math.max(1, state.mockup.height * ratio);
   wrap.style.width = `${width}px`;
   wrap.style.height = `${height}px`;
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
-  renderer.compose(canvas, state, Math.round(width * pixelRatio), Math.round(height * pixelRatio));
+  const pixelRatio = Math.min((window.devicePixelRatio || 1) * zoom, 6, renderer.maxSize / width, renderer.maxSize / height, Math.sqrt(60_000_000 / (width * height)));
+  renderer.compose(canvas, preview ? { ...state, ...previewModes } : state, Math.max(1, Math.floor(width * pixelRatio)), Math.max(1, Math.floor(height * pixelRatio)));
   $("#corner-overlay").setAttribute("viewBox", `0 0 ${width} ${height}`);
   $("#selection").setAttribute("points", state.corners.map(p => `${p.x * width},${p.y * height}`).join(" "));
   handles.forEach((handle, i) => {
@@ -65,6 +79,36 @@ function render() {
   });
   if (drag) updateLoupe();
 }
+
+function resetZoom() {
+  zoom = 1;
+  zoomX = 0;
+  zoomY = 0;
+  wrap.style.transform = "";
+  canvas.title = "Click to zoom in";
+  canvas.style.cursor = "zoom-in";
+  scheduleRender();
+}
+
+canvas.addEventListener("click", event => {
+  if (!state.mockup || drag) return;
+  if (zoom === 4) return resetZoom();
+  const rect = wrap.getBoundingClientRect();
+  const areaRect = area.getBoundingClientRect();
+  const x = (event.clientX - rect.left) / rect.width;
+  const y = (event.clientY - rect.top) / rect.height;
+  const width = rect.width / zoom;
+  const height = rect.height / zoom;
+  const baseLeft = rect.left - zoomX;
+  const baseTop = rect.top - zoomY;
+  zoom *= 2;
+  zoomX = areaRect.left + areaRect.width / 2 - baseLeft - x * width * zoom;
+  zoomY = areaRect.top + areaRect.height / 2 - baseTop - y * height * zoom;
+  wrap.style.transform = `translate(${zoomX}px, ${zoomY}px) scale(${zoom})`;
+  canvas.title = zoom === 4 ? "Click to fit" : "Click to zoom in";
+  canvas.style.cursor = zoom === 4 ? "zoom-out" : "zoom-in";
+  scheduleRender();
+});
 
 function updateLoupe() {
   const { index, clientX, clientY } = drag;
@@ -90,6 +134,7 @@ function moveCorner(index, x, y) {
   const next = state.corners.map((p, i) => i === index ? { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) } : p);
   if (isConvex(next)) {
     state.corners = next;
+    markProjectChanged();
     scheduleRender();
   }
 }
@@ -165,7 +210,8 @@ async function loadFile(file) {
   if ((!file.type.startsWith("image/") && !/\.(png|jpe?g|webp|avif|svg|gif|bmp)$/i.test(file.name)) || file.size > 100 * 1024 * 1024) {
     throw new Error("Choose an image file under 100 MB (PNG, JPG, WebP, AVIF or SVG).");
   }
-  return loadImage(URL.createObjectURL(file), file.name, true);
+  const asset = await loadImage(URL.createObjectURL(file), file.name, true);
+  return { ...asset, type: file.type, blob: file };
 }
 
 function release(asset) {
@@ -173,6 +219,7 @@ function release(asset) {
 }
 
 async function importFiles(files, slot) {
+  if (projectBusy) return notify("Please wait for the project to finish opening.");
   if (!renderer || !state.mockup || !state.screenshot) return notify("The editor is still starting. Please try again in a moment.");
   if (exportInProgress) return notify("Please wait for the export to finish before changing images.");
   if (!files.length) return;
@@ -192,29 +239,56 @@ async function importFiles(files, slot) {
       throw new Error(`This browser supports images up to ${renderer.maxSize}px per side and 60 megapixels. Resize the image before importing.`);
     }
     let resetPlacement = loaded.length === 2;
+    let incomingMockup = null;
     if (loaded.length === 2) {
       let [mockup, screenshot] = loaded;
       const firstIsScreen = /screenshot|screen.?shot|app.?screen/i.test(mockup.name);
       const secondIsMockup = /mockup|background|scene/i.test(screenshot.name);
       const firstPortraitOnly = mockup.width / mockup.height < 0.8 && screenshot.width / screenshot.height >= 1;
       if (firstIsScreen || secondIsMockup || firstPortraitOnly) [mockup, screenshot] = [screenshot, mockup];
+      incomingMockup = mockup;
+    } else {
+      const target = slot || (/screen.?shot/i.test(loaded[0].name) || loaded[0].height > loaded[0].width * 1.4 ? "screenshot" : "mockup");
+      resetPlacement = target === "mockup";
+      if (resetPlacement) incomingMockup = loaded[0];
+    }
+    let remembered = null;
+    if (incomingMockup && projectDatabase) {
+      await flushProject();
+      const projects = await listProjects(projectDatabase);
+      if (revision !== loadRevision) {
+        loaded.forEach(release);
+        return;
+      }
+      remembered = findMatchingProject(projects, incomingMockup.name);
+    }
+    if (loaded.length === 2) {
+      const mockup = incomingMockup;
+      const screenshot = loaded.find(image => image !== mockup);
       release(state.mockup);
       release(state.screenshot);
       Object.assign(state, { mockup, screenshot });
     } else {
       const asset = loaded[0];
       const target = slot || (/screen.?shot/i.test(asset.name) || asset.height > asset.width * 1.4 ? "screenshot" : "mockup");
-      resetPlacement = target === "mockup";
       release(state[target]);
       state[target] = asset;
     }
     state.demo = false;
-    if (resetPlacement) state.corners = initialCorners(state.mockup, state.screenshot);
+    if (resetPlacement) setExportFormat(originalExportFormat(state.mockup));
+    if (resetPlacement) {
+      resetZoom();
+      state.corners = initialCorners(state.mockup, state.screenshot);
+      if (remembered) {
+        applyScreenshotSettings(remembered);
+        notify("Previous screenshot settings restored for this mockup.");
+      }
+    }
     $("#demo-badge").hidden = true;
-    syncAssets();
-    syncRadius();
+    syncSettings();
     scheduleRender();
-    notify(loaded.length === 2 ? "Both images are ready. Drag the corners to fit your screenshot." : `${slot || (loaded[0] === state.mockup ? "Mockup" : "Screenshot")} image updated.`);
+    markProjectChanged();
+    if (!remembered) notify(loaded.length === 2 ? "Both images are ready. Drag the corners to fit your screenshot." : `${slot || (loaded[0] === state.mockup ? "Mockup" : "Screenshot")} image updated.`);
   } catch (error) {
     loaded.forEach(release);
     report(error);
@@ -319,7 +393,56 @@ document.addEventListener("paste", event => {
   importFiles(files, slot);
 });
 
-$("#blend").addEventListener("change", event => { state.blend = event.target.value; scheduleRender(); });
+function setupBlendMenu(id, key) {
+  const select = $(`#${id}`);
+  const menu = $(`#${id}-menu`);
+  const options = $(`#${id}-options`);
+  const sync = () => {
+    select.value = state[key];
+    $(`#${id}-selection`).textContent = select.selectedOptions[0].textContent;
+    options.querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.value === state[key])));
+  };
+  const clearPreview = () => {
+    if (key in previewModes) {
+      delete previewModes[key];
+      scheduleRender();
+    }
+  };
+  for (const option of select.options) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = option.textContent;
+    button.dataset.value = option.value;
+    button.addEventListener("pointerenter", () => { previewModes[key] = option.value; scheduleRender(); });
+    button.addEventListener("focus", () => { previewModes[key] = option.value; scheduleRender(); });
+    button.addEventListener("click", () => {
+      state[key] = option.value;
+      clearPreview();
+      sync();
+      menu.open = false;
+      menu.querySelector("summary").focus();
+      markProjectChanged();
+      scheduleRender();
+    });
+    options.append(button);
+  }
+  options.addEventListener("pointerleave", clearPreview);
+  menu.addEventListener("focusout", event => { if (!menu.contains(event.relatedTarget)) clearPreview(); });
+  menu.addEventListener("toggle", () => { if (!menu.open) clearPreview(); });
+  document.addEventListener("click", event => { if (!menu.contains(event.target)) menu.open = false; });
+  menu.addEventListener("keydown", event => {
+    if (event.key === "Escape" && menu.open) {
+      event.preventDefault();
+      menu.open = false;
+      menu.querySelector("summary").focus();
+    }
+  });
+  select.addEventListener("change", event => { state[key] = event.target.value; sync(); scheduleRender(); });
+  sync();
+  return sync;
+}
+const syncBlend = setupBlendMenu("blend", "blend");
+const syncOverlayBlend = setupBlendMenu("overlay-blend", "overlayBlend");
 $("#opacity").addEventListener("input", event => {
   state.opacity = Number(event.target.value) / 100;
   $("#opacity-value").innerHTML = `${event.target.value}<span>%</span>`;
@@ -338,27 +461,41 @@ for (const selector of ["#radius", "#radius-number"]) {
   });
 }
 $("#iphone").addEventListener("change", () => { syncRadius(); scheduleRender(); });
+for (const [id, key] of [["warmth", "warmth"], ["tint", "tint"], ["overlay-opacity", "overlayOpacity"]]) {
+  $(`#${id}`).addEventListener("input", event => {
+    state[key] = Number(event.target.value);
+    $(`#${id}-value`).textContent = `${event.target.value}${id === "overlay-opacity" ? "%" : ""}`;
+    paintRange(event.target);
+    scheduleRender();
+  });
+}
+$("#overlay-color").addEventListener("input", event => { state.overlayColor = event.target.value; scheduleRender(); });
 $("#export-scale").addEventListener("change", syncDimensions);
 $("#quality").addEventListener("input", event => {
   $("#quality-value").textContent = `${event.target.value}%`;
   paintRange(event.target);
 });
-document.querySelectorAll("[data-format]").forEach(button => button.addEventListener("click", () => {
-  state.format = button.dataset.format;
+function setExportFormat(format) {
+  state.format = format;
   document.querySelectorAll("[data-format]").forEach(item => {
-    const active = item === button;
+    const active = item.dataset.format === format;
     item.classList.toggle("active", active);
     item.setAttribute("aria-pressed", active);
   });
   $("#quality-control").hidden = state.format !== "jpeg";
+}
+document.querySelectorAll("[data-format]").forEach(button => button.addEventListener("click", () => {
+  setExportFormat(button.dataset.format);
+  markProjectChanged();
 }));
 $("#reset").addEventListener("click", () => {
   if (!state.mockup) return;
   state.corners = state.demo ? demoCorners.map(p => ({ ...p })) : initialCorners(state.mockup, state.screenshot);
   scheduleRender();
+  markProjectChanged();
   notify("Screenshot placement reset.");
 });
-$("#fit").addEventListener("click", () => { scheduleRender(); notify("Preview fitted to your workspace."); });
+$("#fit").addEventListener("click", () => { resetZoom(); scheduleRender(); notify("Preview fitted to your workspace."); });
 
 $("#download").addEventListener("click", async () => {
   if (exportInProgress || !state.mockup || !renderer) return;
@@ -407,21 +544,304 @@ window.addEventListener("renderer-error", event => {
   notify(event.detail, true);
 });
 
+function markProjectChanged() {
+  if (projectBusy || !state.mockup || !state.screenshot) return;
+  projectId ||= crypto.randomUUID();
+  dirty = true;
+  editRevision++;
+  clearTimeout(saveTimer);
+  if (!projectDatabase) {
+    $("#save-status").textContent = "Not saved — browser storage unavailable";
+    $("#save-status").dataset.error = "";
+    return;
+  }
+  $("#save-status").textContent = "Saving…";
+  saveTimer = setTimeout(() => flushProject().catch(reportSaveError), 500);
+}
+
+function reportSaveError(error) {
+  $("#save-status").textContent = "Not saved — try Recent projects to retry";
+  $("#save-status").dataset.error = "";
+  console.error(error);
+  notify(`Your project could not be saved locally: ${error.message}. Keep this tab open.`, true);
+}
+
+async function flushProject() {
+  clearTimeout(saveTimer);
+  if (!dirty) return saveQueue;
+  if (!projectDatabase) return Promise.reject(new Error("Browser storage is unavailable"));
+  const revision = editRevision;
+  const asset = value => ({ name: value.name, type: value.type, blob: value.blob });
+  const project = {
+    id: projectId, updatedAt: Date.now(),
+    mockup: asset(state.mockup), screenshot: asset(state.screenshot),
+    corners: state.corners.map(point => ({ ...point })),
+    radius: state.radius, opacity: state.opacity, blend: state.blend, format: state.format,
+    warmth: state.warmth, tint: state.tint, overlayColor: state.overlayColor, overlayOpacity: state.overlayOpacity, overlayBlend: state.overlayBlend,
+    iphone: $("#iphone").checked, scale: $("#export-scale").value, quality: $("#quality").value,
+    demo: state.demo,
+  };
+  const thumbnail = document.createElement("canvas");
+  const thumbnailScale = Math.min(240 / state.mockup.width, 160 / state.mockup.height);
+  thumbnail.width = Math.max(1, Math.round(state.mockup.width * thumbnailScale));
+  thumbnail.height = Math.max(1, Math.round(state.mockup.height * thumbnailScale));
+  render(false);
+  thumbnail.getContext("2d").drawImage(canvas, 0, 0, thumbnail.width, thumbnail.height);
+  if (Object.keys(previewModes).length) scheduleRender();
+  dirty = false;
+  const write = async () => {
+    try {
+      project.thumbnail = await new Promise((resolve, reject) => thumbnail.toBlob(
+        blob => blob ? resolve(blob) : reject(new Error("Could not create project thumbnail")),
+        "image/jpeg", 0.8,
+      ));
+      await saveProject(projectDatabase, project);
+      if (projectId === project.id && revision === editRevision) {
+        dirty = false;
+        $("#save-status").textContent = "All changes saved on this device";
+        delete $("#save-status").dataset.error;
+      }
+      await refreshRecentProjects().catch(report);
+    } catch (error) {
+      if (projectId === project.id) dirty = true;
+      throw error;
+    }
+  };
+  saveQueue = saveQueue.then(write, write);
+  return saveQueue;
+}
+
+function syncSettings() {
+  syncBlend();
+  $("#opacity").value = Math.round(state.opacity * 100);
+  $("#opacity-value").innerHTML = `${Math.round(state.opacity * 100)}<span>%</span>`;
+  $("#quality-value").textContent = `${$("#quality").value}%`;
+  for (const [id, key] of [["warmth", "warmth"], ["tint", "tint"], ["overlay-opacity", "overlayOpacity"]]) {
+    $(`#${id}`).value = state[key];
+    $(`#${id}-value`).textContent = `${state[key]}${id === "overlay-opacity" ? "%" : ""}`;
+  }
+  $("#overlay-color").value = state.overlayColor;
+  syncOverlayBlend();
+  setExportFormat(state.format);
+  syncRadius();
+  syncAssets();
+  $("#demo-badge").hidden = !state.demo;
+  document.querySelectorAll("input[type=range]").forEach(paintRange);
+  render();
+}
+
+function applyScreenshotSettings(project) {
+  Object.assign(state, screenshotSettings(project));
+  $("#iphone").checked = project.iphone;
+}
+
+async function decodeProject(project) {
+  const results = await Promise.allSettled(["mockup", "screenshot"].map(async slot => {
+    const saved = project[slot];
+    return loadFile(new File([saved.blob], saved.name, { type: saved.type || saved.blob.type }));
+  }));
+  const loaded = results.filter(result => result.status === "fulfilled").map(result => result.value);
+  const failed = results.find(result => result.status === "rejected");
+  if (failed) {
+    loaded.forEach(release);
+    throw failed.reason;
+  }
+  if (loaded.some(image => image.width > renderer.maxSize || image.height > renderer.maxSize)) {
+    loaded.forEach(release);
+    throw new Error("This project's images exceed this browser's graphics limit.");
+  }
+  return loaded;
+}
+
+async function restoreProject(project) {
+  const [mockup, screenshot] = await decodeProject(project);
+  release(state.mockup);
+  release(state.screenshot);
+  Object.assign(state, {
+    mockup, screenshot, corners: project.corners.map(point => ({ ...point })),
+    radius: project.radius, opacity: project.opacity, blend: project.blend,
+    format: project.format, demo: project.demo,
+  });
+  applyScreenshotSettings(project);
+  resetZoom();
+  projectId = project.id;
+  dirty = false;
+  $("#iphone").checked = project.iphone;
+  $("#export-scale").value = project.scale;
+  $("#quality").value = project.quality;
+  syncSettings();
+  $("#save-status").textContent = "All changes saved on this device";
+  delete $("#save-status").dataset.error;
+}
+
+async function demoImages() {
+  return Promise.all(["mockup", "screenshot"].map(async slot => {
+    const response = await fetch(`${import.meta.env.BASE_URL}demo-${slot}.svg`);
+    if (!response.ok) throw new Error(`Could not load the demo ${slot} (${response.status}).`);
+    return loadFile(new File([await response.blob()], slot === "mockup" ? "Studio lavender.svg" : "A little headspace.svg", { type: "image/svg+xml" }));
+  }));
+}
+
+$(".settings").addEventListener("input", markProjectChanged);
+$(".settings").addEventListener("change", markProjectChanged);
+window.addEventListener("pagehide", () => { flushProject().catch(reportSaveError); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushProject().catch(reportSaveError);
+});
+window.addEventListener("beforeunload", event => {
+  if (dirty || $("#save-status").textContent === "Saving…") {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
+let recentUrls = [];
+function releaseRecentUrls() {
+  recentUrls.forEach(url => URL.revokeObjectURL(url));
+  recentUrls = [];
+}
+let recentRevision = 0;
+async function refreshRecentProjects() {
+    const revision = ++recentRevision;
+    const projects = await listProjects(projectDatabase);
+    if (revision !== recentRevision) return;
+    const focusedId = document.activeElement?.closest("[data-project-id]")?.dataset.projectId;
+    releaseRecentUrls();
+    $("#projects-list").replaceChildren();
+    if (!projects.length) {
+      const empty = document.createElement("li");
+      empty.className = "projects-empty";
+      empty.textContent = "Nothing here yet. Add images or adjust a setting to save your first project.";
+      $("#projects-list").append(empty);
+    }
+    for (const project of projects) {
+      const row = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "project-entry";
+      button.dataset.projectId = project.id;
+      if (project.id === projectId) button.setAttribute("aria-current", "true");
+      const image = document.createElement("img");
+      image.alt = "";
+      image.src = URL.createObjectURL(project.thumbnail);
+      recentUrls.push(image.src);
+      const text = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = project.mockup.name;
+      const description = document.createElement("small");
+      description.textContent = `${project.screenshot.name} · ${new Date(project.updatedAt).toLocaleString()}`;
+      text.append(title, description);
+      if (project.id === projectId) {
+        const current = document.createElement("em");
+        current.textContent = "Current project";
+        text.append(current);
+      }
+      button.append(image, text);
+      button.addEventListener("click", async () => {
+        if (projectBusy || exportInProgress) return notify("Please wait for the current operation to finish.");
+        if (project.id === projectId) {
+          wrap.scrollIntoView({ block: "center" });
+          handles[0].focus({ preventScroll: true });
+          return;
+        }
+        projectBusy = true;
+        ++loadRevision;
+        button.disabled = true;
+        try {
+          await flushProject();
+          await restoreProject(project);
+          projectBusy = false;
+          markProjectChanged();
+          wrap.scrollIntoView({ block: "center" });
+          handles[0].focus({ preventScroll: true });
+          notify("Project restored. Pick up where you left off.");
+        } catch (error) {
+          report(error);
+        } finally {
+          projectBusy = false;
+          button.disabled = false;
+        }
+      });
+      row.append(button);
+      $("#projects-list").append(row);
+      if (project.id === focusedId) button.focus({ preventScroll: true });
+    }
+}
+
+$("#recent-projects").addEventListener("click", async () => {
+  if (projectBusy || exportInProgress) return notify("Please wait for the current operation to finish.");
+  projectBusy = true;
+  ++loadRevision;
+  try {
+    await flushProject();
+    if (!projectDatabase) throw new Error("Browser storage is unavailable.");
+    await refreshRecentProjects();
+    $("#recent-projects-panel").scrollIntoView({ block: "start" });
+    $("#recent-projects-panel").focus({ preventScroll: true });
+  } catch (error) {
+    reportSaveError(error);
+  } finally {
+    projectBusy = false;
+  }
+});
+
+$("#new-project").addEventListener("click", async () => {
+  if (projectBusy || exportInProgress) return notify("Please wait for the current operation to finish.");
+  projectBusy = true;
+  $("#new-project").disabled = true;
+  ++loadRevision;
+  try {
+    await flushProject();
+    const [mockup, screenshot] = await demoImages();
+    release(state.mockup);
+    release(state.screenshot);
+    Object.assign(state, {
+      mockup, screenshot, corners: demoCorners.map(point => ({ ...point })),
+      radius: 48, opacity: 1, blend: "source-over", format: "png", demo: true,
+      ...colorDefaults,
+    });
+    resetZoom();
+    projectId = null;
+    dirty = false;
+    $("#iphone").checked = true;
+    $("#export-scale").value = "1";
+    $("#quality").value = "98";
+    syncSettings();
+    if (projectDatabase) await refreshRecentProjects();
+    $("#save-status").textContent = "New project — add your images to begin";
+    notify("New project ready. Your previous work is in Recent projects.");
+  } catch (error) {
+    report(error);
+  } finally {
+    projectBusy = false;
+    $("#new-project").disabled = false;
+  }
+});
+
 async function init() {
   try {
+    projectBusy = true;
     renderer = new Renderer();
-    const [mockup, screenshot] = await Promise.all([
-      loadImage(`${import.meta.env.BASE_URL}demo-mockup.svg`, "Studio lavender.svg"),
-      loadImage(`${import.meta.env.BASE_URL}demo-screenshot.svg`, "A little headspace.svg"),
-    ]);
+    const [mockup, screenshot] = await demoImages();
     Object.assign(state, { mockup, screenshot, corners: demoCorners.map(p => ({ ...p })) });
     syncAssets();
     syncRadius();
     document.querySelectorAll("input[type=range]").forEach(paintRange);
     render();
+    try {
+      projectDatabase = await openProjects();
+      const projects = await listProjects(projectDatabase);
+      if (projects.length) await restoreProject(projects[0]);
+      await refreshRecentProjects();
+    } catch (error) {
+      reportSaveError(error);
+      $("#projects-list").textContent = "Recent projects could not be loaded. Use Recent projects above to retry.";
+    }
   } catch (error) {
     $("#download").disabled = true;
     report(error);
+  } finally {
+    projectBusy = false;
   }
 }
 init();
